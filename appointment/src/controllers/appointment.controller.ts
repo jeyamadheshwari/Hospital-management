@@ -1,9 +1,11 @@
 import {repository} from '@loopback/repository';
 import {post, get, del, requestBody, param, HttpErrors} from '@loopback/rest';
 import {DoctorRepository} from '../repositories/doctor.repository';
-import{AppointmentRepository} from '../repositories/appointment.repository';    
+import {AppointmentRepository} from '../repositories/appointment.repository';
+import {UserRepository} from '../repositories/user.repository';
 import {inject} from '@loopback/core';
 import {RestBindings} from '@loopback/rest';
+import {EmailService} from '../services/email.service';
 
 export class AppointmentController {
   constructor(
@@ -11,10 +13,13 @@ export class AppointmentController {
     public appointmentRepo: AppointmentRepository,
 
     @repository(DoctorRepository)
-    public doctorRepo: DoctorRepository, //  Inject Doctor repo
+    public doctorRepo: DoctorRepository,
+
+    @repository(UserRepository)
+    public userRepo: UserRepository, 
   ) {}
 
-  //  Book an appointment (only patients)
+  //book an appointment (only patients)
   @post('/appointments')
   async create(
     @requestBody() body: any,
@@ -27,13 +32,11 @@ export class AppointmentController {
 
     const {doctorId, appointmentDate, startTime, endTime} = body;
     const date = new Date(appointmentDate);
-    const weekday = date.toLocaleDateString('en-US', {weekday: 'short'}); // Mon, Tue, etc.
+    const weekday = date.toLocaleDateString('en-US', {weekday: 'short'});
 
-    // Fetch doctor directly from repository
     const doctor = await this.doctorRepo.findById(doctorId);
     if (!doctor) throw new HttpErrors.NotFound('Doctor not found');
 
-    // Check doctor availability
     const available = doctor.availability?.some(
       (slot: any) =>
         slot.day === weekday &&
@@ -41,10 +44,9 @@ export class AppointmentController {
         endTime <= slot.endTime,
     );
     if (!available) {
-      throw new HttpErrors.BadRequest(`Doctor not available on ${weekday} at that time`);
+      throw new HttpErrors.BadRequest(`Doctor not available on ${weekday} at this time`);
     }
 
-    // Prevent overlapping appointments
     const existing = await this.appointmentRepo.findOne({
       where: {
         doctorId,
@@ -59,8 +61,8 @@ export class AppointmentController {
       throw new HttpErrors.BadRequest('This time slot is already booked');
     }
 
-    // Save appointment
-    return this.appointmentRepo.create({
+    //Save appointment
+    const appointment = await this.appointmentRepo.create({
       doctorId,
       patientId: user.id,
       appointmentDate,
@@ -68,9 +70,56 @@ export class AppointmentController {
       endTime,
       status: 'scheduled',
     });
+
+    //Send Email Notifications
+    const patient = await this.userRepo.findById(user.id);
+    const emailService = new EmailService();
+
+    await emailService.sendMail(
+      doctor.email,
+      'New Appointment Booked',
+      `An appointment has been booked by patient on ${appointmentDate} from ${startTime} to ${endTime}.`
+    );
+
+    await emailService.sendMail(
+      patient.email,
+      'Appointment Confirmed',
+      `Your appointment with Dr. ${doctor.name} is confirmed for ${appointmentDate} from ${startTime} to ${endTime}.`
+    );
+
+    return appointment;
   }
 
-  // Get my appointments (patients)
+  @get('/appointments/doctor-availability')
+async getAllDoctorAvailability() {
+  // 1) Fetch all doctors
+  const doctors = await this.doctorRepo.find();
+
+  const result = [];
+
+  // 2) For each doctor, fetch booked appointments
+  for (const doc of doctors) {
+    const booked = await this.appointmentRepo.find({
+      where: {doctorId: doc.id},
+    });
+
+    result.push({
+      doctorId: doc.id,
+      doctorName: doc.name,
+      specialization: doc.specialization,
+      availability: doc.availability || [],
+      alreadyBooked: booked.map(a => ({
+        date: a.appointmentDate,
+        startTime: a.startTime,
+        endTime: a.endTime,
+      })),
+    });
+  }
+
+  return result;
+}
+
+  //Get my appointments (patients)
   @get('/appointments/me')
   async getMyAppointments(@inject(RestBindings.Http.REQUEST) req: any) {
     const user = req.user;
@@ -80,7 +129,7 @@ export class AppointmentController {
     return this.appointmentRepo.find({where: {patientId: user.id}});
   }
 
-  // Cancel an appointment (patients)
+  //Cancel appointment
   @del('/appointments/{id}')
   async cancelAppointment(
     @param.path.number('id') id: number,
@@ -97,7 +146,7 @@ export class AppointmentController {
     return {message: 'Appointment cancelled'};
   }
 
-  // Get doctor schedule with already booked slots
+  //Doctor schedule
   @get('/appointments/doctor/{doctorId}/schedule')
   async getDoctorSchedule(@param.path.number('doctorId') doctorId: number) {
     const doctor = await this.doctorRepo.findById(doctorId);
