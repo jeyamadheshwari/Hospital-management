@@ -16,15 +16,29 @@ export class AppointmentController {
     public doctorRepo: DoctorRepository,
 
     @repository(UserRepository)
-    public userRepo: UserRepository, 
+    public userRepo: UserRepository,
   ) {}
 
-  //book an appointment (only patients)
+  // sstatus update
+  async updateStatusIfNeeded() {
+    const appointments = await this.appointmentRepo.find();
+    const today = new Date().toISOString().split('T')[0];
+
+    for (const a of appointments) {
+      if (a.status !== 'cancelled' && a.appointmentDate < today) {
+        a.status = 'completed';
+        await this.appointmentRepo.updateById(a.id!, a);
+      }
+    }
+  }
+
+  // Book an appointment (only patients)
   @post('/appointments')
   async create(
     @requestBody() body: any,
     @inject(RestBindings.Http.REQUEST) req: any,
   ) {
+    await this.updateStatusIfNeeded();
     const user = req.user;
     if (!user || user.role !== 'patient') {
       throw new HttpErrors.Forbidden('Only patients can book appointments');
@@ -44,24 +58,22 @@ export class AppointmentController {
         endTime <= slot.endTime,
     );
     if (!available) {
-      throw new HttpErrors.BadRequest(`Doctor not available on ${weekday} at this time`);
+      throw new HttpErrors.BadRequest(
+        `Doctor not available on ${weekday} at this time`,
+      );
     }
 
     const existing = await this.appointmentRepo.findOne({
       where: {
         doctorId,
         appointmentDate,
-        and: [
-          {startTime: {lt: endTime}},
-          {endTime: {gt: startTime}},
-        ],
+        and: [{startTime: {lt: endTime}}, {endTime: {gt: startTime}}],
       },
     });
     if (existing) {
       throw new HttpErrors.BadRequest('This time slot is already booked');
     }
 
-    //Save appointment
     const appointment = await this.appointmentRepo.create({
       doctorId,
       patientId: user.id,
@@ -71,57 +83,60 @@ export class AppointmentController {
       status: 'scheduled',
     });
 
-    //Send Email Notifications
+    // Send Email Notifications
     const patient = await this.userRepo.findById(user.id);
     const emailService = new EmailService();
 
     await emailService.sendMail(
       doctor.email,
       'New Appointment Booked',
-      `An appointment has been booked by patient on ${appointmentDate} from ${startTime} to ${endTime}.`
+      `An appointment has been booked by patient ${patient.email} on ${appointmentDate} from ${startTime} to ${endTime}.`,
     );
 
     await emailService.sendMail(
       patient.email,
       'Appointment Confirmed',
-      `Your appointment with Dr. ${doctor.name} is confirmed for ${appointmentDate} from ${startTime} to ${endTime}.`
+      `Your appointment with Dr. ${doctor.name} is confirmed for ${appointmentDate} from ${startTime} to ${endTime}.`,
     );
 
     return appointment;
   }
 
+  // ✅ New Endpoint: Get all doctor availability (AV2 format)
   @get('/appointments/doctor-availability')
-async getAllDoctorAvailability() {
-  // 1) Fetch all doctors
-  const doctors = await this.doctorRepo.find();
+  async getAllDoctorAvailability() {
+    await this.updateStatusIfNeeded();
 
-  const result = [];
+    const doctors = await this.doctorRepo.find();
+    const result = [];
 
-  // 2) For each doctor, fetch booked appointments
-  for (const doc of doctors) {
-    const booked = await this.appointmentRepo.find({
-      where: {doctorId: doc.id},
-    });
+    for (const doc of doctors) {
+      const booked = await this.appointmentRepo.find({
+        where: {doctorId: doc.id, status: {neq: 'cancelled'}},
+      });
 
-    result.push({
-      doctorId: doc.id,
-      doctorName: doc.name,
-      specialization: doc.specialization,
-      availability: doc.availability || [],
-      alreadyBooked: booked.map(a => ({
-        date: a.appointmentDate,
-        startTime: a.startTime,
-        endTime: a.endTime,
-      })),
-    });
+      const bookedSlots = booked.map(b => ({
+        date: b.appointmentDate,
+        startTime: b.startTime,
+        endTime: b.endTime,
+      }));
+
+      result.push({
+        doctorId: doc.id,
+        doctorName: doc.name,
+        specialization: doc.specialization,
+        availability: doc.availability || [],
+        booked: bookedSlots,
+      });
+    }
+
+    return result;
   }
 
-  return result;
-}
-
-  //Get my appointments (patients)
+  // Get my appointments (patients)
   @get('/appointments/me')
   async getMyAppointments(@inject(RestBindings.Http.REQUEST) req: any) {
+    await this.updateStatusIfNeeded();
     const user = req.user;
     if (!user || user.role !== 'patient') {
       throw new HttpErrors.Forbidden('Only patients can view their appointments');
@@ -129,7 +144,7 @@ async getAllDoctorAvailability() {
     return this.appointmentRepo.find({where: {patientId: user.id}});
   }
 
-  //Cancel appointment
+  // Cancel appointment (emails both doctor & patient)
   @del('/appointments/{id}')
   async cancelAppointment(
     @param.path.number('id') id: number,
@@ -142,17 +157,38 @@ async getAllDoctorAvailability() {
       throw new HttpErrors.Forbidden('Not authorized to cancel this appointment');
     }
 
-    await this.appointmentRepo.deleteById(id);
-    return {message: 'Appointment cancelled'};
+    const doctor = await this.doctorRepo.findById(appointment.doctorId);
+    const patient = await this.userRepo.findById(user.id);
+    const emailService = new EmailService();
+
+    await emailService.sendMail(
+      doctor.email,
+      'Appointment Cancelled',
+      `The patient ${patient.email} has cancelled the appointment scheduled on ${appointment.appointmentDate} from ${appointment.startTime} to ${appointment.endTime}.`,
+    );
+
+    await emailService.sendMail(
+      patient.email,
+      'Appointment Cancellation Successful',
+      `Your appointment with Dr. ${doctor.name} on ${appointment.appointmentDate} from ${appointment.startTime} to ${appointment.endTime} has been cancelled successfully.`,
+    );
+
+    appointment.status = 'cancelled';
+    await this.appointmentRepo.updateById(id, appointment);
+
+    return {message: 'Appointment cancelled and notifications sent'};
   }
 
-  //Doctor schedule
+  // Doctor schedule (includes booked slots)
   @get('/appointments/doctor/{doctorId}/schedule')
   async getDoctorSchedule(@param.path.number('doctorId') doctorId: number) {
+    await this.updateStatusIfNeeded();
     const doctor = await this.doctorRepo.findById(doctorId);
     if (!doctor) throw new HttpErrors.NotFound('Doctor not found');
 
-    const booked = await this.appointmentRepo.find({where: {doctorId}});
+    const booked = await this.appointmentRepo.find({
+      where: {doctorId, status: {neq: 'cancelled'}},
+    });
 
     return {
       doctor: {
@@ -161,7 +197,7 @@ async getAllDoctorAvailability() {
         specialization: doctor.specialization,
       },
       availability: doctor.availability,
-      alreadyBooked: booked.map(a => ({
+      booked: booked.map(a => ({
         date: a.appointmentDate,
         startTime: a.startTime,
         endTime: a.endTime,
